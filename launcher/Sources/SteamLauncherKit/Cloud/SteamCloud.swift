@@ -290,18 +290,25 @@ public struct CloudSync {
         return FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir) && !isDir.boolValue
     }
 
-    /// Every spelling of `rel` under `base` (hlvr/save, hlvr/SAVE, …), on a case-sensitive disk.
+    /// Every spelling of `rel` under `base` (hlvr/save, hlvr/SAVE, …), on a case-sensitive disk. A link under another
+    /// spelling is not one: the app links hlvr/SAVE to hlvr/save for the game's autosave commit (kl_app.c), and its files
+    /// are the folder's own, which must not be folded into themselves.
     static func spellings(of rel: String, in base: URL) -> [URL] {
         var dirs = [base]
         for part in rel.split(separator: "/") {
             dirs = dirs.flatMap { d -> [URL] in
                 let names = (try? FileManager.default.contentsOfDirectory(atPath: d.path)) ?? []
                 return names.filter { $0.lowercased() == part.lowercased() }.map { d.appendingPathComponent($0) }
+                    .filter { $0.lastPathComponent == part.lowercased() || !isLink($0) }
                     .filter { var isDir: ObjCBool = false
                               return FileManager.default.fileExists(atPath: $0.path, isDirectory: &isDir) && isDir.boolValue }
             }
         }
         return dirs
+    }
+
+    private static func isLink(_ u: URL) -> Bool {
+        (try? FileManager.default.attributesOfItem(atPath: u.path))?[.type] as? FileAttributeType == .typeSymbolicLink
     }
 
     /// A save slot folder, e.g. `s0` in `s0/autosave.sav`: letters then a number.

@@ -24,7 +24,7 @@
     "video": "defaults/video2-visionpro-demo.txt",
     "purpose_strings": "defaults/purpose-strings.plist",
     "texture_max": 2048,
-    "texture_pool_mb": 2560,
+    "texture_pool_mb": 1536,
     "texture_bias_min": 1.0,
     "device_info": "defaults/device-info.json"
   },

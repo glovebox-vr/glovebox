@@ -208,6 +208,50 @@ private func klEyePixelFormat(_ glInternal: UInt32) -> MTLPixelFormat? {
     }
 }
 
+// KLStaleFade begin
+/// KL_CP_STALE_FADE's timing: how dark the picture the guest left is, from when its frames arrive. A frame is
+/// "new" when the guest has sent a picture since the last display frame. After `hold` seconds without one, the
+/// picture fades to black over another `hold`; it fades back in, over the same time, only once frames have come
+/// at least every `flowGap` for `flowFor`, so a stray frame in the middle of a load (or a game that draws a few
+/// pictures and stalls again) does not flash the scene up. Apart from the compositor so a scripted clock can run it.
+struct KLStaleFade {
+    enum Event: Equatable {
+        case fadedOut(quiet: Double)        // black now, after this long without a frame
+        case backIn(gap: Double)            // the picture is back; the frameless stretch lasted this long
+    }
+    static let flowGap = 0.1
+    static let flowFor = 0.25
+    let hold: Double
+    private(set) var fade: Float = 0        // 0 = the picture as it is, 1 = black
+    private var lastNew = 0.0, flowingSince = 0.0, lastTick = 0.0, gap = 0.0
+    private var out = false
+
+    init(hold: Double) { self.hold = hold }
+
+    /// One display frame at `now` (seconds, any monotonic clock).
+    mutating func tick(newFrame: Bool, now: Double) -> Event? {
+        let dt = lastTick > 0 ? min(max(now - lastTick, 0), 0.1) : 0
+        lastTick = now
+        if newFrame {
+            if lastNew == 0 || now - lastNew > Self.flowGap { flowingSince = now }
+            if lastNew > 0 && now - lastNew > hold { gap = now - lastNew }
+            lastNew = now
+        }
+        guard hold > 0, lastNew > 0 else { return nil }
+        let quiet = now - lastNew
+        let step = Float(dt / hold)
+        if quiet > hold {
+            fade = min(1, fade + step)
+        } else if fade > 0, quiet <= Self.flowGap, lastNew - flowingSince >= Self.flowFor {
+            fade = max(0, fade - step)
+        }
+        if fade >= 1 && !out { out = true; return .fadedOut(quiet: quiet) }
+        if fade <= 0 && out { out = false; return .backIn(gap: gap) }
+        return nil
+    }
+}
+// KLStaleFade end
+
 final class KleptonCompositor {
     private let layerRenderer: LayerRenderer
     private var device: MTLDevice!
@@ -371,6 +415,18 @@ final class KleptonCompositor {
     private var guestFrameEvent: MTLSharedEvent!
     private var lastGuestFrame: UInt64 = 0
     private var staleInARow = 0
+
+    // KL_CP_STALE_FADE=<ms> (0, the default, is off; Alyx's env file turns it on). Once the guest has sent no new
+    // frame for that long, the picture it left fades to black over the same time, and fades back in once its
+    // frames flow again. An Alyx level load is ~10 s without a frame, and without this the headset shows the old
+    // level's last frame for all of it, turned with the head and nothing else: a frozen picture that slides with
+    // every step. SteamVR shows its loading void there, which the game asks for (FadeGrid before the load,
+    // measured on device 2026-11-07); the OpenVR shim answers that call but has nothing to draw it with.
+    private let staleFadeHold = Double(max(0, klEnvFloat("KL_CP_STALE_FADE", 0))) / 1000
+    private lazy var staleFader = KLStaleFade(hold: staleFadeHold)
+    private var staleFade: Float = 0                 // 0 = the picture as it is, 1 = black
+    private var dimPipeline: MTLRenderPipelineState?
+    private var dimDepthPipeline: MTLRenderPipelineState?
 
     // Keyed by (eye, stage). Indexed by stage from the start rather than kept
     // as a "last texture" global, because ovrp_GetEyeTextureStageCount is ours
@@ -940,6 +996,28 @@ final class KleptonCompositor {
                 let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
                 dd.usage = .shaderRead
                 depthDummy = device.makeTexture(descriptor: dd)
+            }
+            // KL_CP_STALE_FADE's version of the same pass: the same shaders and outputs, the colour scaled by the
+            // encoder's blend-colour alpha and the alpha written exactly as the plain pass writes it (the eye
+            // pass must stay opaque: see the overlay pipeline below). Nothing is read from the attachment.
+            if staleFadeHold > 0 {
+                let c: MTLRenderPipelineColorAttachmentDescriptor = desc.colorAttachments[0]
+                c.isBlendingEnabled = true
+                c.rgbBlendOperation = .add
+                c.alphaBlendOperation = .add
+                c.sourceRGBBlendFactor = .blendAlpha
+                c.destinationRGBBlendFactor = .zero
+                c.sourceAlphaBlendFactor = .one
+                c.destinationAlphaBlendFactor = .zero
+                dimPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+                if Self.gameDepth {
+                    desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_depth_f")
+                    dimDepthPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+                    desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
+                }
+                c.isBlendingEnabled = false
+                NSLog("[cp] stale-frame fade: to black after \(Int(staleFadeHold * 1000)) ms without a new frame "
+                      + "(KL_CP_STALE_FADE)" + (dimPipeline == nil ? " — its pipeline FAILED to build, so it is off" : ""))
             }
 
             // Depth WRITES, which this pass never did. visionOS reprojects the
@@ -2075,6 +2153,21 @@ final class KleptonCompositor {
         return out + (bad ? "  <-- the guest and the composite are on DIFFERENT textures" : "")
     }
 
+    /// KL_CP_STALE_FADE (see staleFadeHold): how dark this display frame shows the guest's picture. Each change
+    /// of state is said once, so a log has every load's fade and how long the game sent nothing.
+    private func updateStaleFade(newFrame: Bool, now: CFTimeInterval) {
+        guard staleFadeHold > 0, dimPipeline != nil else { return }
+        switch staleFader.tick(newFrame: newFrame, now: now) {
+        case .fadedOut(let quiet)?:
+            NSLog(String(format: "[cp] no new frame from the game for %.1f s: faded to black (KL_CP_STALE_FADE)", quiet))
+        case .backIn(let gap)?:
+            NSLog(String(format: "[cp] the game's frames are back after %.1f s without one: faded back in", gap))
+        case nil:
+            break
+        }
+        staleFade = staleFader.fade
+    }
+
     private func renderFrame() -> Int {
         guard let frame = layerRenderer.queryNextFrame() else { bailNoFrame += 1; return 0 }
         frame.startUpdate()
@@ -2264,6 +2357,7 @@ final class KleptonCompositor {
             lastGuestFrame = frameValue
         }
         if frameValue != 0 { kl_guest_stall_check(UInt32(staleInARow)) }
+        updateStaleFade(newFrame: frameValue != 0 && staleInARow == 0, now: CACurrentMediaTime())
 
         // The pose the picture will be *shown* at, as freshly predicted as we
         // can make it: re-queried here rather than reused from updatePoses,
@@ -2976,7 +3070,10 @@ final class KleptonCompositor {
                 }
             }
             let useDepth = depthTex[0] != nil || depthTex[1] != nil
-            enc.setRenderPipelineState(probePipeline ?? (useDepth ? depthPipeline! : pipeline))
+            // KL_CP_STALE_FADE: the picture the guest left, dimmed toward black (updateStaleFade).
+            let dim = probePipeline == nil && staleFade > 0 ? (useDepth ? dimDepthPipeline : dimPipeline) : nil
+            enc.setRenderPipelineState(probePipeline ?? dim ?? (useDepth ? depthPipeline! : pipeline))
+            if dim != nil { enc.setBlendColor(red: 0, green: 0, blue: 0, alpha: 1 - staleFade) }
             if let depthState { enc.setDepthStencilState(depthState) }
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)

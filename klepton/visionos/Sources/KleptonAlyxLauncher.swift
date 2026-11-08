@@ -106,6 +106,11 @@ struct AlyxLauncherScreens: View {
     /// cloud; a stalled sync is cut off after 10 s), then this.
     private func play() {
         NSLog("[launcher] Play: saves synced, starting the game")
+        // The language the player chose in the account menu (or the headset's own, for Automatic), as Steam's name:
+        // kl_app_boot puts it on the game's command line as -language. Set before BootView boots, which is when it's read.
+        let language = GameLanguage.resolve(GameLanguage.choice)
+        setenv("KL_ALYX_LANGUAGE", language.id, 1)
+        NSLog("[launcher] game language: %@ (chosen: %@)", language.id, GameLanguage.choice)
         Lifecycle.gameStarted = true
         model.preparing = LauncherModel.Preparing(fraction: 0, secondsLeft: nil, firstTimeOnly: false, title: "Starting")
         playing = true

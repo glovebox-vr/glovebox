@@ -224,7 +224,11 @@ def defaults(package, work, foz_path, emit):
     # the game's texture streaming pool, fixed (MB), optional: without it the pool is gameinfo's 2816 MB (Steam Frame),
     # which cap 1024 never fills. Above 1024 the pool stays full in chapter 1, which is fine as long as the streamer
     # only drops what is least needed (the floor below) and what is in view fits: cap 2048 does in 2560 MB, cap 4096
-    # needs ~3.3 GB, more than the headset has (Mac, 2026-10-12)
+    # needs ~3.3 GB, more than the headset has (Mac, 2026-10-12). 1536 MB since 2026-11-08: Chapters 6 to 8 reach the
+    # app's 8192 MB limit, where the headset ends the game without a report. The footprint climbs about 1 GB over a
+    # level's first 15-20 minutes and tops out near 6 GB plus the pool: runs at 2560 ended with 128 and 108 MB left, and one
+    # at 2048 reached 8.0-8.1 GB twice and ended with 80 MB left, a jump of 325 MB in 2 s the minute before. The [hb] line's
+    # gfx= says how much of that is the GPU's
     pool = int(man["texture_pool_mb"]) if man.get("texture_pool_mb") else 0
     # the lowest the streamer may scale every texture request when the pool is full: the game's own 0.8 (the Frame's,
     # and PC's Low/Medium) softens every texture and sharpens it again each time the pool fills, which reads as

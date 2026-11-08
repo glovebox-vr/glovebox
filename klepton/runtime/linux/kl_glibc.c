@@ -1244,12 +1244,18 @@ static size_t bm_take(void *p) {   // removes p from the table; returns its mapp
     for (unsigned k = 0; k < kBmSlots && g_bm[h].p; k++, h = (h + 1) & (kBmSlots - 1))
         if (g_bm[h].p == p) {
             len = g_bm[h].len; g_bm_live -= len; g_bm_count--;
-            unsigned i = h;
-            for (;;) {   // backward-shift delete keeps the probe chains intact
-                unsigned j = (i + 1) & (kBmSlots - 1);
+            // Backward-shift delete keeps the probe chains intact: walk the rest of the run and move back into the hole
+            // each entry that the hole would cut off from its home slot. An entry that may stay (its home lies between
+            // the hole and it) is stepped over, not the end of the walk: one further along can still need the hole.
+            // Stopping at the first such entry (as this did) left later entries behind an empty slot, unfindable: their
+            // free went to the host free (which ignores a pointer it doesn't own) and a realloc to the host path, which
+            // copied malloc_size() = 0 bytes into the new block (the old contents silently lost) or, shrinking, got NULL.
+            unsigned i = h, j = h;
+            for (unsigned n = 1; n < kBmSlots; n++) {
+                j = (j + 1) & (kBmSlots - 1);
                 if (!g_bm[j].p) break;
                 unsigned want = bm_h(g_bm[j].p);
-                if (((j - want) & (kBmSlots - 1)) >= ((j - i) & (kBmSlots - 1))) { g_bm[i] = g_bm[j]; i = j; } else break;
+                if (((j - want) & (kBmSlots - 1)) >= ((j - i) & (kBmSlots - 1))) { g_bm[i] = g_bm[j]; i = j; }
             }
             g_bm[i].p = NULL; g_bm[i].len = 0;
             break;

@@ -14,6 +14,8 @@ struct LibraryView: View {
     @State private var showShareAsk = false
     @State private var showLicenses = false
     @State private var showDiagnostics = false
+    /// The game's language (GameLanguage): "auto" or Steam's name for one. The game takes it at the next Play.
+    @AppStorage(GameLanguage.defaultsKey) private var gameLanguage = GameLanguage.automatic.id
 
     var body: some View {
         VStack(alignment: .leading, spacing: 36) {
@@ -235,6 +237,16 @@ struct LibraryView: View {
 
     private var accountMenu: some View {
         Menu {
+            // Steam's per-game language setting, which the headset has no Steam client for: text and subtitles (the
+            // voice is English in every language). Automatic is the headset's own language when the game has it.
+            Picker(selection: $gameLanguage) {
+                Text("Automatic (\(GameLanguage.resolve(GameLanguage.automatic.id).name))")
+                    .tag(GameLanguage.automatic.id)
+                ForEach(GameLanguage.alyx) { Text($0.name).tag($0.id) }
+            } label: {
+                Label("Game Language", systemImage: "globe")
+            }
+            .pickerStyle(.menu)
             Toggle("Help Improve Glovebox", isOn: Binding(get: { model.shareStutters ?? false },
                                                           set: { model.setShareStutters($0) }))
             Button("Share Diagnostics") { showDiagnostics = true }

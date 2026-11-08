@@ -2213,6 +2213,16 @@ except its own control vars (next section).
 - `KL_AUTOBOOT=0` — autoboot is the default too; `=0` restores the
   Boot-button-only shape, for attaching a debugger or starting a GPU capture
   before the guest runs.
+- `KL_ALYX_LANGUAGE=<Steam language>` — Half-Life: Alyx's language, as Steam's
+  API name (`schinese`, `tchinese`, `japanese`, `koreana`, `latam`, ...):
+  `kl_app_boot` appends `-language <name>` to `KL_ALYX_ARGS` and logs a
+  `language  :` line. On a PC Steam answers `GetCurrentGameLanguage`; here
+  `ISteamApps` is NULL, so without this the engine stays English. The headset
+  launcher sets it at Play from the account menu's **Game Language**
+  (Automatic = the headset's first language the game has;
+  `launcher/Sources/SteamLauncherKit/Game/GameLanguage.swift`). A name that is
+  not one of Steam's is dropped, not passed on. Text and subtitles only: the
+  game's voice is English in every language.
 - `KL_CUSTOM_LAUNCHER=1` — **build-time** flag (set when generating the Xcode
   project, e.g. `KL_CUSTOM_LAUNCHER=1 ./build_run_vpro.sh hl1`), NOT a runtime env
   var. It bakes the "configure, then Start" launcher into the game builds
@@ -2319,7 +2329,31 @@ written down is a value found twice.
 - `KL_SENSE_VEL_FRAME=world` — read `AccessoryAnchor.velocity`/`angularVelocity`
   as already being in tracking space. Default treats them as accessory-local
   and rotates them by the grip orientation, which is what ALVR does; Apple
-  documents neither, and the two differ only in direction.
+  documents neither, and the two differ only in direction. (The visionOS 27.2
+  SDK's `accessory_tracking.h` now says "in the local coordinate system", i.e.
+  the anchor's own frame, which is not quite the grip's.) Only read with
+  `KL_SENSE_VEL=measured`, or when there are no poses to derive from.
+- `KL_SENSE_VEL=measured` — publish ARKit's `AccessoryAnchor` velocities for
+  the Sense controllers, the old default. **Default `derived`**: the
+  least-squares motion of the grip poses the anchor stream measured, on each
+  anchor's own `timestamp` (`KLMotion` in `KleptonControllers.swift`), with the
+  lever arm to the published point added. A hand whose tracker has only the
+  orientation, or whose newest pose is over 100 ms old, falls back to ARKit's
+  numbers; a derived speed over 15 m/s (a tracking jump) is refused. GitHub #3:
+  thrown objects dropped straight down while the hands moved, which is a
+  near-zero velocity. Each `[throw]` line (a grip or trigger opening) now logs
+  ARKit's speed and the poses' side by side, and the first three fast movements
+  per hand print `[ctrl] sense velocity`. Alyx's own throw does not read these
+  velocities, as far as its code reads (libclient `0x150b070`, `0x1506684`): it
+  differences the hand's positions over `vr_handinfo_history_size` frames, skips
+  the newest `vr_handinfo_history_ignore_size` steps, and takes the fastest of
+  the rest, times `vr_throw_velocity_scale`. See `DEMO.txt`; each thing let go
+  prints `KLTHROW` in the game's console with the speed it actually left at.
+- `KL_SENSE_VEL_WINDOW_MS=<ms>` — the derivation's window, default **33**: three
+  samples at 90 Hz or two of a ~30 Hz stream (it always reaches back to at
+  least two), so the estimate trails the newest pose by about 16 ms. Wider is
+  smoother and later; a 40 m/s² throw read 92% of its release speed at 33 ms
+  and 85% at 50.
 - `KL_HAND_MIRROR=1` — left hand back on ALVR's *mirrored* wrist→grip
   constant. The default left constant is `R · Rx(180)`, forced by four
   playtests.
@@ -2392,6 +2426,15 @@ written down is a value found twice.
 - `KL_CP_QUALITY=<0..1>` — the render quality to request (default 1.0). The
   ceiling costs memory and per-frame GPU time; the *running* quality is set
   separately by the render loop.
+- `KL_CP_STALE_FADE=<ms>` — once the guest has sent no new frame for that
+  long, the picture it left fades to black over the same time; it fades back in
+  once frames have flowed (one at least every 0.1 s) for 0.25 s, so a stray
+  frame in the middle of a load does not flash it up. Default 0 (off: the last
+  picture is reprojected for as long as it lasts). Alyx's env file sets 500: a
+  level load there is ~10 s without a frame, and SteamVR would show its loading
+  void, which the game asks for with `FadeGrid` (the OpenVR shim answers the
+  call but has nothing to draw it with). The log says `[cp] no new frame from
+  the game for N s: faded to black` and `the game's frames are back after N s`.
 
 ## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
 
