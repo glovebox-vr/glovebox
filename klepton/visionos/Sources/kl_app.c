@@ -213,6 +213,40 @@ static void alyx_msgbox(const char *title, const char *msg) {
 #include "linux/kl_alyx_app.h"
 static char g_envline[2048], g_filesline[512];
 int kl_app_test_run(const char *resources, const char *container) { return kl_alyx_app_test_run(resources, container); }
+// The game's language. On a PC, Steam tells Alyx the language the player picked for it (ISteamApps::
+// GetCurrentGameLanguage); here there is no Steam client and ISteamApps stays NULL (runtime/linux/kl_steamnet.cpp), so
+// the engine falls back to English. Its own -language switch does the same job (libengine2 and liblocalize read it):
+// KL_ALYX_LANGUAGE=<Steam's API name for a language> (schinese, tchinese, japanese, koreana, ...) puts it on the game's
+// command line, after KL_ALYX_ARGS' own arguments. The launcher sets it from the player's choice before Play
+// (launcher/App/AlyxLauncher/GameLanguage.swift); a test script's env file may name one. A name that is not one of
+// Steam's is left out, so a typo can't become a stray argument and the game stays English. Only English has voice:
+// every other language is the text and subtitles. Run once by kl_app_boot, before the guest thread reads KL_ALYX_ARGS.
+static const char *const k_steam_languages[] = {
+    "arabic", "brazilian", "bulgarian", "czech", "danish", "dutch", "english", "finnish", "french", "german", "greek",
+    "hungarian", "indonesian", "italian", "japanese", "koreana", "latam", "norwegian", "polish", "portuguese",
+    "romanian", "russian", "schinese", "spanish", "swedish", "tchinese", "thai", "turkish", "ukrainian", "vietnamese",
+};
+static char g_langline[160];
+static void alyx_language(void) {
+    const char *want = getenv("KL_ALYX_LANGUAGE");
+    if (!want || !*want) {
+        snprintf(g_langline, sizeof g_langline, "  language  : the game's default, English (KL_ALYX_LANGUAGE unset)\n");
+        return;
+    }
+    const char *lang = NULL;
+    for (size_t i = 0; i < sizeof k_steam_languages / sizeof k_steam_languages[0] && !lang; i++)
+        if (!strcmp(want, k_steam_languages[i])) lang = k_steam_languages[i];
+    if (!lang) {
+        snprintf(g_langline, sizeof g_langline,
+                 "  language  : \"%.40s\" is not one of Steam's language names, so the game's default, English\n", want);
+        return;
+    }
+    static char args[2048];
+    const char *a = getenv("KL_ALYX_ARGS");
+    snprintf(args, sizeof args, "%s%s-language %s", a && *a ? a : "", a && *a ? " " : "", lang);
+    setenv("KL_ALYX_ARGS", args, 1);
+    snprintf(g_langline, sizeof g_langline, "  language  : %s (-language, from KL_ALYX_LANGUAGE)\n", lang);
+}
 #endif   // configure runs before the log opens; boot prints it
 int kl_app_configure(const char *resources, const char *container) {
     // Once per process: the launcher's "Preparing graphics" (kl_app_prewarm) configures before boot does, and a
@@ -634,6 +668,17 @@ static long long kl_avail_memory(void) {
 #endif
 }
 
+// Of the footprint, what is graphics memory (Metal's textures and buffers), and what the system has compressed; -1 where
+// the OS does not say. For the heartbeat, to tell what is climbing when the game nears its limit.
+static void kl_footprint_parts(long long *gfx, long long *compressed) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    *gfx = *compressed = -1;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return;
+    *compressed = (long long)info.compressed;
+    if (count >= TASK_VM_INFO_COUNT) *gfx = info.ledger_tag_graphics_footprint + info.ledger_tag_graphics_footprint_compressed;
+}
+
 static long long kl_phys_footprint(void) {
     task_vm_info_data_t info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
@@ -708,9 +753,11 @@ static void *heartbeat(void *arg) {
             long long foot = kl_phys_footprint();
             if (foot > peak) peak = foot;
             long long avail = kl_avail_memory();
-            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM peak=%lldM avail=%lldM\n",
+            long long gfx, compressed;
+            kl_footprint_parts(&gfx, &compressed);
+            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM peak=%lldM avail=%lldM gfx=%lldM comp=%lldM\n",
                     tm.tm_hour, tm.tm_min, tm.tm_sec, phase,
-                    foot >> 20, peak >> 20, avail >> 20);
+                    foot >> 20, peak >> 20, avail >> 20, gfx >> 20, compressed >> 20);
             fflush(stderr);
         }
         {   // Memory guard: the headset ends the game at its limit without a report
@@ -898,6 +945,25 @@ static int steamlink_vr_begin(void) {
     return 0;
 }
 
+#ifdef KL_APP_ALYX
+// hlvr/SAVE, a link to hlvr/save. The game commits an autosave by renaming it under "SAVE/", the spelling in its code,
+// and writes everything else under "save/": one folder on a PC's disk, two names on the headset's, which is
+// case-sensitive. So every commit failed ('Unable to rename "SAVE/s6/autosavedangerous.sav"', 39 of 39 in a player's
+// run, 2026-11-08), after the game had already moved autosave.sav along to autosave01: the newest autosave was gone from
+// the game's list until the next plain autosave. A folder of that spelling (an older launcher's) stays as it is: the
+// Steam Cloud sync folds it into save/, and the next start links. The sync does not count a link as a spelling
+// (SteamCloud.spellings).
+static void alyx_link_save_folder(void) {
+    char hlvr[1100], link[1200];
+    struct stat st;
+    snprintf(hlvr, sizeof hlvr, "%s/alyx/assets/hlvr", g_container);
+    snprintf(link, sizeof link, "%s/SAVE", hlvr);
+    if (stat(hlvr, &st) != 0 || lstat(link, &st) == 0) return;
+    if (symlink("save", link) == 0) fprintf(stderr, "[alyx] hlvr/SAVE now links to hlvr/save, for the game's autosave commit\n");
+    else fprintf(stderr, "[alyx] could not link hlvr/SAVE to hlvr/save: %s\n", strerror(errno));
+}
+#endif
+
 int kl_app_boot(void) {
     // Once, and never concurrently. The Boot button invites a second press, and
     // the second entry is not merely redundant: the runtime's JNI tables are
@@ -916,6 +982,9 @@ int kl_app_boot(void) {
 
     if (!*g_libdir) return fail("kl_app_configure was not called");
     if (open_log()) return fail("could not open the log file");
+#ifdef KL_APP_ALYX
+    alyx_link_save_folder();
+#endif
 
     // Every thread that runs guest code must seed bionic's stack-guard canary
     // into TSD slot 5 first, and this is the thread the whole boot runs on.
@@ -944,6 +1013,10 @@ int kl_app_boot(void) {
 #ifdef KL_APP_ALYX
     if (g_envline[0]) printf("%s", g_envline);
     if (g_filesline[0]) printf("%s", g_filesline);
+    if (g_target->kind == KL_GUEST_LINUX) {
+        alyx_language();
+        printf("%s", g_langline);
+    }
 #endif
     // The front door, with the reason. It is chosen from the ENVIRONMENT in
     // kl_app_configure — which runs before the log file is open, so it cannot

@@ -165,6 +165,41 @@ final class CloudSyncTests: XCTestCase {
         XCTAssertEqual(cloud.files[upper]?.data, Data("headset".utf8))
     }
 
+    /// The app links hlvr/SAVE to hlvr/save for the game's autosave commit (kl_app.c). The link is not a second folder:
+    /// nothing is folded, moved or backed up, each save goes up once under its one name, and the link stays.
+    func testTheGamesSaveLinkIsNotASecondSpelling() async throws {
+        try requireCaseSensitiveDisk()
+        try writeLocal("s0/autosave.sav", "headset", t0)
+        let link = root.appendingPathComponent("hlvr/SAVE").path
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: "save")
+
+        var r = try await sync()
+        XCTAssertEqual(r.uploaded, [name("s0/autosave.sav")])
+        XCTAssertEqual(Array(cloud.files.keys), [name("s0/autosave.sav")])
+        XCTAssertEqual(readLocal("s0/autosave.sav"), "headset")
+        XCTAssertEqual(backups(), [])
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link), "save")
+
+        r = try await sync()
+        XCTAssertEqual(r.unchanged, 1)
+        XCTAssertEqual(r.uploaded, [])
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link), "save")
+
+        // The game saves through the link: one file changed, one upload.
+        try Data("commit".utf8).write(to: URL(fileURLWithPath: link).appendingPathComponent("s0/autosave.sav"))
+        try FileManager.default.setAttributes([.modificationDate: t0.addingTimeInterval(100)],
+                                              ofItemAtPath: local("s0/autosave.sav").path)
+        r = try await sync()
+        XCTAssertEqual(r.uploaded, [name("s0/autosave.sav")])
+        XCTAssertEqual(cloud.files[name("s0/autosave.sav")]?.data, Data("commit".utf8))
+
+        // A cloud save in capitals still lands in the lowercase folder, beside the link.
+        cloud.files["%GameInstall%game/hlvr/SAVE/S1/autosave.sav"] = (Data("pc".utf8), t0)
+        r = try await sync()
+        XCTAssertEqual(readLocal("s1/autosave.sav"), "pc")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link), "save")
+    }
+
     /// A new game started on the headset in slot s0, while the cloud already has a different s0:
     /// both games are kept, the headset's in the next free slot.
     func testNewHeadsetSlotNeverReplacesACloudSlot() async throws {

@@ -5,13 +5,23 @@
 # compositor render quality 0.40. KL_GUEST_PACE_HZ=60 paces to every 2nd display frame: 45 fps at 90 Hz, 60 fps at
 # 120 Hz (the device gave 120 Hz in the validation run). Convars: FIX-demo-convars.lua (AO proxies off, the fixed
 # table pinned at every spawn); video settings video2-visionpro-demo.txt; fidelity table vr_fidelity_fixed_1.0.csv.
-KL_ALYX_PROFILE_ARGS=+vr_fidelity_level_auto 0 +vr_fidelity_level 0 +vr_msaa 4 +vr_symmetric_fov 0 +r_texture_stream_throttle_count 6 +r_texture_stream_throttle_amount 20 +log_verbosity VR max
+KL_ALYX_PROFILE_ARGS=+vr_fidelity_level_auto 0 +vr_fidelity_level 0 +vr_msaa 4 +vr_symmetric_fov 0 +r_texture_stream_throttle_count 6 +r_texture_stream_throttle_amount 20 +log_verbosity VR max +vr_handinfo_history_size 4 +vr_handinfo_history_ignore_size 1
+# Throws, the last two arguments above: the game takes a throw's speed from the hand's last positions frame by frame, not
+# from the controller's velocity. Of vr_handinfo_history_size (5) frames it skips the newest vr_handinfo_history_ignore_size
+# (3) steps and takes the fastest of the rest, times vr_throw_velocity_scale (1.6). At a PC's 90 fps that is the hand 33-44 ms
+# before letting go; at our 45 fps, 66-88 ms, while a hard throw's arm is still speeding up, so it flew short (a player's
+# report, 2026-11-08). 4 and 1 read the steps from 66 to 22 ms before, which also rides out the controller's ~30 Hz samples.
 KLVR_EYE_SIZE=2784,2208
 KL_GUEST_PACE_HZ=60
 KL_VK_MERGE=1
 KL_VK_MERGE_VIS=1
 KLVR_PACE_FALLBACK=0
 KL_CP_QUALITY=0.40
+# A level load shows black, not the old level's last frame: the game sends no frame for the ~10 s of a load (and
+# asks for SteamVR's loading void with FadeGrid, which the OpenVR shim answers but cannot draw), and the headset
+# kept showing that last frame, turned with the head and nothing else (a player's report, 2026-11-08). After 0.5 s
+# without a new frame it now fades to black over 0.5 s, and back in once frames flow again. 0 turns it off.
+KL_CP_STALE_FADE=500
 KL_VRR=0
 # Textures give their memory back: MoltenVK by default makes every Vulkan memory block a full-size Metal heap, so the
 # gaps a streamed-out texture leaves inside the engine's 8 MB texture blocks stay allocated (500-780 MB once the
@@ -20,5 +30,7 @@ KL_VRR=0
 MVK_CONFIG_USE_MTLHEAP=0
 # Big game allocations give their memory back: Klepton hands the game's allocations of 1 MB or more their own mapped
 # pages, unmapped on free, instead of the Mac allocator's large-block cache, which kept freed pages resident (Mac
-# 2026-10-12: 389-422 MB less at the Chapter 1 street with the bigger texture cap, same frame pacing).
+# 2026-10-12: 389-422 MB less at the Chapter 1 street with the bigger texture cap, same frame pacing). Needs a kit with
+# the table's delete fixed (kl_glibc.c bm_take, 2026-11-07): the 0.1.5 kit's lost live blocks from its table now and
+# then (a realloc of one then kept none of its bytes, or got NULL; a free of one aborted).
 KL_GUEST_BIGALLOC_MMAP=1048576

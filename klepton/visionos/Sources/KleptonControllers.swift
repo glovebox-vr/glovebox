@@ -59,9 +59,11 @@ struct KleptonHandState {
     var stick: SIMD2<Float> = .zero
     /// Tracking-space linear (m/s) and angular (rad/s) velocity, for the
     /// ovrpPoseStatef fields libunity forwards to `XRNodeState.velocity`.
-    /// Only the Sense controllers report these — a `HandAnchor` carries no
-    /// motion at all, and differentiating a pose stream to invent one produces
-    /// a number that looks physical and is mostly tracker noise.
+    /// Only the Sense controllers have these — a `HandAnchor` carries no
+    /// motion at all, and differentiating a hand skeleton to invent one
+    /// produces a number that looks physical and is mostly tracker noise. A
+    /// Sense controller's comes from its measured grip poses (KLMotion), or from
+    /// ARKit's estimate with KL_SENSE_VEL=measured.
     var linearVelocity: SIMD3<Float> = .zero
     var angularVelocity: SIMD3<Float> = .zero
     /// Whether a Sense controller supplied this, as opposed to a hand anchor.
@@ -409,6 +411,110 @@ struct KLSenseTune {
 
     static let velocityIsLocal =
         ProcessInfo.processInfo.environment["KL_SENSE_VEL_FRAME"] != "world"
+
+    /// `KL_SENSE_VEL=measured|derived` — where a Sense controller's published
+    /// velocity comes from.
+    ///
+    /// **derived**, the default: the motion of the grip poses the tracker
+    /// measured, differentiated on each anchor's own timestamp over the last
+    /// `KL_SENSE_VEL_WINDOW_MS` (default 33: three samples at 90 Hz, two of the
+    /// ~30 Hz anchor stream, so the estimate trails the newest sample by about
+    /// 16 ms either way; see `KLMotion.derive`). It is the
+    /// motion of exactly the poses the guest is handed, in tracking space by
+    /// construction, so neither a frame convention nor a dead estimate can come
+    /// between the two. **measured** is the previous behaviour, ARKit's own
+    /// `AccessoryAnchor.velocity`/`angularVelocity` ("in the local coordinate
+    /// system", per accessory_tracking.h) — and it is also what a hand gets when
+    /// there is nothing to differentiate (the tracker has its orientation only,
+    /// or no fresh sample).
+    ///
+    /// Why the default changed: a thrown object that drops straight down at
+    /// release while the hand visibly moves (GitHub #3, on visionOS 27) is what
+    /// a near-zero velocity looks like to a game that throws with the
+    /// controller's velocity, and it soft-locks every place the game wants
+    /// something thrown, such as glass to break. The [throw] line logs both
+    /// numbers at every release, so a log settles which one is right.
+    enum VelocitySource { case measured, derived }
+    static let velocitySource: VelocitySource =
+        ProcessInfo.processInfo.environment["KL_SENSE_VEL"] == "measured" ? .measured : .derived
+    static let velocityWindow: Double = {
+        guard let v = ProcessInfo.processInfo.environment["KL_SENSE_VEL_WINDOW_MS"],
+              let f = Double(v), f > 0 else { return 0.033 }
+        return f / 1000.0
+    }()
+}
+
+/// One measured Sense grip pose: where the tracker put the `.grip`, at the
+/// instant the anchor says it is about (`t`, its own timestamp), and when this
+/// process received it (`received`, CACurrentMediaTime), which is the clock the
+/// staleness check uses so it never compares two clocks.
+struct KLGripSample {
+    var t: Double
+    var received: Double
+    var p: SIMD3<Float>
+    var q: simd_quatf
+}
+
+enum KLMotion {
+    /// Keep `trail` (oldest first) a run of consecutive samples: repeats and
+    /// out-of-order ones are dropped, a gap of more than 0.1 s starts it over (a
+    /// gap is not motion), and nothing older than 0.25 s is kept.
+    static func record(_ s: KLGripSample, in trail: inout [KLGripSample]) {
+        if let last = trail.last {
+            if s.t <= last.t { return }
+            if s.t - last.t > 0.1 { trail.removeAll() }
+        }
+        trail.append(s)
+        while let first = trail.first, s.t - first.t > 0.25 { trail.removeFirst() }
+    }
+
+    /// The motion of the poses in `trail`: the linear velocity as the
+    /// least-squares slope of position over the last `window` seconds (reaching
+    /// back one more sample when the window holds only one, so a slower anchor
+    /// stream still answers), the angular velocity from the rotation across the
+    /// same span; both in the samples' own frame, tracking space. nil when there
+    /// is nothing to differentiate, when the newest sample arrived more than
+    /// `maxAge` before `now` (the poses stopped coming, which is not the hand
+    /// stopping), or when the answer is faster than a hand moves (a tracking
+    /// jump, which must not fling whatever the hand lets go of).
+    static func derive(_ trail: [KLGripSample], window: Double, now: Double,
+                       maxAge: Double = 0.1) -> (v: SIMD3<Float>, w: SIMD3<Float>)? {
+        guard trail.count >= 2, let last = trail.last, now - last.received <= maxAge else { return nil }
+        var first = trail.count - 1
+        while first > 0 && last.t - trail[first - 1].t <= window { first -= 1 }
+        if first == trail.count - 1 { first -= 1 }
+        let span = trail[first...]
+        let oldest = trail[first]
+        let dt = last.t - oldest.t
+        guard dt >= 0.004 else { return nil }
+
+        // v = Σ(t - t̄)(p - p̄) / Σ(t - t̄)², with time in Double around its mean.
+        let n = Double(span.count)
+        let tm = span.reduce(0.0) { $0 + $1.t } / n
+        var pm = SIMD3<Float>.zero
+        for s in span { pm += s.p }
+        pm /= Float(n)
+        var num = SIMD3<Float>.zero
+        var den = 0.0
+        for s in span {
+            let d = s.t - tm
+            num += Float(d) * (s.p - pm)
+            den += d * d
+        }
+        guard den > 0 else { return nil }
+        let v = num / Float(den)
+
+        // The rotation between the ends in tracking space (newest = dq · oldest),
+        // the short way round: quaternions double-cover, and without the flip a
+        // small turn can read as a nearly full one.
+        var dq = last.q * oldest.q.inverse
+        if dq.real < 0 { dq = simd_quatf(real: -dq.real, imag: -dq.imag) }
+        let angle = dq.angle
+        let w = angle > 1e-6 ? simd_normalize(dq.imag) * (angle / Float(dt)) : SIMD3<Float>.zero
+
+        guard simd_length(v) <= 15, simd_length(w) <= 60 else { return nil }
+        return (v, w)
+    }
 }
 
 final class KleptonControllers {
@@ -438,6 +544,10 @@ final class KleptonControllers {
     /// same thing `queryDeviceAnchor(atTimestamp:)` already does for the head —
     /// the controllers were simply never given the equivalent.
     private var accessoryAnchor: [Int: AccessoryAnchor] = [:]
+    /// Each hand's recent measured grip poses, oldest first, from the anchor
+    /// stream: what the derived velocity differentiates (KLSenseTune.velocitySource).
+    /// Under `lock`, like the anchors it comes from.
+    private var gripTrail: [[KLGripSample]] = [[], []]
     /// Held so the render thread can predict against it. `makeAccessoryProvider`
     /// is the only writer, and it runs before the session that feeds it.
     private var accessoryProvider: AccessoryTrackingProvider?
@@ -550,6 +660,7 @@ final class KleptonControllers {
         releaseHaptics()
         lock.lock()
         accessoryAnchor.removeAll()
+        gripTrail = [[], []]
         // The provider goes too: predicting against a provider whose session is
         // being torn down and rebuilt is the one way a stale anchor could still
         // produce a fresh-looking pose after the controller is gone.
@@ -591,9 +702,38 @@ final class KleptonControllers {
 
     private func store(hand: Int, removed: Bool, anchor: AccessoryAnchor) {
         if !removed { probeSenseFrames(hand: hand, anchor) }
+        let sample = removed ? nil : Self.gripSample(anchor)
         lock.lock()
         defer { lock.unlock() }
         accessoryAnchor[hand] = removed ? nil : anchor
+        if removed { gripTrail[hand].removeAll() }
+        else if let sample { KLMotion.record(sample, in: &gripTrail[hand]) }
+    }
+
+    /// Where an anchor puts the hand's hold on the controller: `.grip` with the
+    /// platform's `.rendered` correction, or the controller's own origin when it
+    /// publishes no grip (a stylus). The published pose starts from this, and so
+    /// does the velocity derived from it.
+    private static func gripMatrix(_ a: AccessoryAnchor) -> simd_float4x4 {
+        a.accessory.locations.contains(.grip)
+            ? a.coordinateSpace(for: .grip, correction: .rendered).ancestorFromSpaceTransformFloat().matrix
+            : a.originFromAnchorTransform
+    }
+
+    /// The grip pose an anchor measured, for the derived velocity, at the
+    /// anchor's own timestamp (the receive time if it has none). nil while the
+    /// tracker has the orientation only: the position is then not a measurement,
+    /// and differentiating it would report a moving hand as stopped.
+    private static func gripSample(_ a: AccessoryAnchor) -> KLGripSample? {
+        switch a.trackingState {
+        case .positionOrientationTracked, .positionOrientationTrackedLowAccuracy: break
+        default: return nil
+        }
+        let received = CACurrentMediaTime()
+        let m = gripMatrix(a)
+        return KLGripSample(t: a.timestamp > 0 ? a.timestamp : received, received: received,
+                            p: SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z),
+                            q: simd_normalize(simd_quatf(m)))
     }
 
     /// Which hands have already described themselves. Written from the anchor
@@ -678,6 +818,7 @@ final class KleptonControllers {
         lock.lock()
         let stored = accessoryAnchor[hand]
         let provider = accessoryProvider
+        let trail = gripTrail[hand]
         lock.unlock()
         guard let stored, let provider else { return nil }
         // **KL_SENSE_PREDICT=0 hands over the raw anchor**, and it exists
@@ -710,10 +851,7 @@ final class KleptonControllers {
         // pointing a saber out of that is the same class of bug as pointing one
         // out of the wrist. A controller that publishes no grip (a stylus)
         // falls back to its base.
-        let m = a.accessory.locations.contains(.grip)
-            ? a.coordinateSpace(for: .grip, correction: .rendered)
-                .ancestorFromSpaceTransformFloat().matrix
-            : a.originFromAnchorTransform
+        let m = Self.gripMatrix(a)
         let raw = simd_quatf(m)
         let t = KLSenseTune.shared[hand]
         // The LIVE tune, re-read every pose so a slider in the boot window moves
@@ -739,8 +877,40 @@ final class KleptonControllers {
         // about the frame the tracker measured in.
         var v = a.velocity, w = a.angularVelocity
         if KLSenseTune.velocityIsLocal { v = raw.act(v); w = raw.act(w) }
+        let measured = simd_length(v)
+
+        // ...or the motion of the measured poses themselves (the default; see
+        // KLSenseTune.velocitySource), whenever there are fresh ones to
+        // differentiate. The trail is the grip's, and the published point sits
+        // `p - grip` from it, which turning the controller moves as well.
+        // Derived either way, so the logs below compare the two in both modes.
+        var derived: Float?
+        if let d = KLMotion.derive(trail, window: KLSenseTune.velocityWindow, now: now) {
+            derived = simd_length(d.v)
+            if KLSenseTune.velocitySource == .derived {
+                let grip = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
+                v = d.v + simd_cross(d.w, p - grip)
+                w = d.w
+            }
+        }
+        lastMotion[hand] = (measured, derived)
+        // The first few fast movements per hand say how the two sources compare
+        // on this OS: the poses moving at speed while ARKit's estimate stays
+        // near zero is the thrown-object bug in one line.
+        if let d = derived, d > 1.5, motionSaid[hand] < 3 {
+            motionSaid[hand] += 1
+            NSLog(String(format: "[ctrl] sense velocity (%@): the poses move at %.2f m/s, ARKit's estimate "
+                         + "says %.2f m/s; publishing %@ (KL_SENSE_VEL)", hand == 0 ? "L" : "R", d, measured,
+                         KLSenseTune.velocitySource == .derived ? "the poses'" : "ARKit's"))
+        }
         return (p, q, v, w)
     }
+
+    /// Per hand, the speed ARKit estimated and the speed derived from the poses
+    /// (nil when there were none to differentiate), for the [throw] line and
+    /// `sense velocity`. Render thread only, like `sensePose`.
+    private var lastMotion: [(measured: Float, derived: Float?)] = [(0, nil), (0, nil)]
+    private var motionSaid = [0, 0]
 
     /// Say, once, how far ahead the frame's presentation time actually is and
     /// whether the cap reaches it.
@@ -1727,21 +1897,28 @@ final class KleptonControllers {
     private var gripHeld = [false, false]
     private var recentSpeed: [[(t: Double, v: Float)]] = [[], []]
 
-    /// One line in the headset's own log (never in a stutter report) each time a grip opens, which is when the game
-    /// throws what the hand held: the speed handed to the game at that moment, the fastest in the 300 ms before it
+    /// One line in the headset's own log (never in a stutter report) each time a grip or trigger opens, either of which
+    /// is when the game throws what the hand held (a player's whole run held things on the trigger and never touched the
+    /// grip, so this used to stay silent): the speed handed to the game at that moment, the fastest in the 300 ms before it
     /// and how long before, and where the pose came from. A thrown object that drops straight then reads as either
     /// "no speed reached the game" or "the grip opened after the hand had stopped" (GitHub #3).
     private func noteGripRelease(hand: Int, _ st: KleptonHandState, sense: Bool, at t: Double) {
         let v = simd_length(st.linearVelocity)
         recentSpeed[hand].append((t, v))
         recentSpeed[hand].removeAll { t - $0.t > 0.3 }
-        let held = st.handTrigger > 0.5
+        let held = st.handTrigger > 0.5 || st.indexTrigger > 0.5
         defer { gripHeld[hand] = held }
         guard gripHeld[hand], !held else { return }
         let peak = recentSpeed[hand].max { $0.v < $1.v } ?? (t: t, v: v)
-        NSLog(String(format: "[throw] %@ grip opened: speed %.2f m/s (fastest %.2f m/s, %.0f ms before), spin %.1f rad/s, pose from %@",
+        let motion = lastMotion[hand]
+        let sources = sense
+            ? String(format: "; ARKit's estimate %.2f m/s, the poses' %@, published %@", motion.measured,
+                     motion.derived.map { String(format: "%.2f m/s", $0) } ?? "none",
+                     KLSenseTune.velocitySource == .measured || motion.derived == nil ? "ARKit's" : "the poses'")
+            : ""
+        NSLog(String(format: "[throw] %@ hand opened: speed %.2f m/s (fastest %.2f m/s, %.0f ms before), spin %.1f rad/s, pose from %@%@",
                      hand == 0 ? "L" : "R", v, peak.v, (t - peak.t) * 1000, simd_length(st.angularVelocity),
-                     sense ? "the controller" : "the hand"))
+                     sense ? "the controller" : "the hand", sources))
     }
 
     /// Merge every source and push the result across to kl_ovrp.

@@ -52,6 +52,13 @@ Once, before the first build, if your Xcode came from the App Store: Xcode made 
 
 You type it into Glovebox's own sign-in screen. It's sent only to Steam, encrypted with Steam's key, and never stored. Glovebox keeps only Steam's sign-in token, in your Keychain. All of the code is in this repository.
 
+### How do I play in another language?
+
+Open Glovebox: HLA on the headset, tap your name at the top right and choose **Game Language**. **Automatic**, the
+default, uses your Vision Pro's language when the game has it, the way Steam uses its own. The game takes the new
+language the next time you press Play. Half-Life: Alyx has its text and subtitles in 28 languages and its voice in
+English only, so the voices stay English. Turn on subtitles in the game's options to read them.
+
 ### Can Glovebox run other games or mods?
 
 Not yet. It's built so that more can be added later.
